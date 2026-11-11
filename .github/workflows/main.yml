@@ -1,0 +1,236 @@
+# ─────────────────────────────────────────────────────────────────
+#  SOCKS5 / HTTP Proxy via Ngrok  ·  GitHub Actions
+#  - Dante SOCKS5 proxy on :1080
+#  - Squid HTTP proxy on :3128
+#  - Ngrok TCP tunnel → both ports exposed
+#  - Exponential-backoff tunnel detection (lifted from the rdp rig)
+#  - Ngrok watchdog auto-restart
+#  - Heartbeat every 10 min
+#  - Session runs until 350-min timeout
+# ─────────────────────────────────────────────────────────────────
+name: Proxy via Ngrok
+
+on: [push]
+
+env:
+  PROXY_USER: "proxyuser"
+  PROXY_PASS: "Proxy@123"
+
+jobs:
+  proxy-setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Install proxy daemons
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y dante-server squid apache2-utils
+
+      - name: Configure Dante SOCKS5
+        run: |
+          sudo tee /etc/danted.conf > /dev/null <<'EOF'
+          logoutput: stderr
+          internal: 0.0.0.0 port = 1080
+          external: eth0
+          clientmethod: none
+          socksmethod: username
+
+          client pass {
+              from: 0.0.0.0/0 to: 0.0.0.0/0
+              log: error
+          }
+
+          socks pass {
+              from: 0.0.0.0/0 to: 0.0.0.0/0
+              command: bind connect udpassociate
+              log: error
+              socksmethod: username
+          }
+          EOF
+
+      - name: Configure Squid HTTP proxy
+        run: |
+          sudo tee /etc/squid/squid.conf > /dev/null <<'EOF'
+          http_port 3128
+          auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
+          auth_param basic realm proxy
+          acl authenticated proxy_auth REQUIRED
+          http_access allow authenticated
+          http_access deny all
+          forwarded_for off
+          request_header_access Via deny all
+          request_header_access X-Forwarded-For deny all
+          EOF
+
+      - name: Create proxy user accounts
+        run: |
+          # Dante PAM user
+          sudo useradd -r -s /usr/sbin/nologin ${{ env.PROXY_USER }} || true
+          echo "${{ env.PROXY_USER }}:${{ env.PROXY_PASS }}" | sudo chpasswd
+
+          # Squid htpasswd user
+          sudo htpasswd -cb /etc/squid/passwd ${{ env.PROXY_USER }} ${{ env.PROXY_PASS }}
+          sudo chown proxy:proxy /etc/squid/passwd
+          sudo chmod 640 /etc/squid/passwd
+
+      - name: Start proxy daemons
+        run: |
+          sudo systemctl restart danted
+          sudo systemctl restart squid
+          sleep 2
+          sudo systemctl is-active danted  || (sudo journalctl -u danted -n 20 && exit 1)
+          sudo systemctl is-active squid   || (sudo journalctl -u squid  -n 20 && exit 1)
+          echo "Both proxy daemons running"
+
+      - name: Cache Ngrok binary
+        id: ngrok-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ngrok_cache
+          key: ngrok-linux-amd64-stable-v1
+
+      - name: Download Ngrok
+        if: steps.ngrok-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.ngrok_cache
+          curl -fsSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-linux-amd64.zip" \
+            -o /tmp/ngrok.zip
+          unzip -o /tmp/ngrok.zip -d ~/.ngrok_cache
+          rm /tmp/ngrok.zip
+          echo "ngrok downloaded"
+
+      - name: Stage Ngrok binary
+        run: |
+          cp ~/.ngrok_cache/ngrok /usr/local/bin/ngrok
+          chmod +x /usr/local/bin/ngrok
+          echo "ngrok staged"
+
+      - name: Authenticate Ngrok
+        run: |
+          ngrok authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
+
+      - name: Run Session
+        run: |
+          LOG_SOCKS="/tmp/ngrok_socks.log"
+          LOG_HTTP="/tmp/ngrok_http.log"
+
+          start_ngrok_socks() {
+            ngrok tcp 1080 --log=stdout --log-format=json > "$LOG_SOCKS" 2>&1 &
+            echo $!
+          }
+
+          start_ngrok_http() {
+            ngrok tcp 3128 --log=stdout --log-format=json > "$LOG_HTTP" 2>&1 &
+            echo $!
+          }
+
+          # NOTE: free ngrok plan allows ONE simultaneous tunnel.
+          # Set EXPOSE_MODE=socks5 or http below; paid plan → both.
+          EXPOSE_MODE="socks5"   # change to "http" or comment out for paid both-tunnel
+
+          PID_SOCKS=""
+          PID_HTTP=""
+
+          if [ "$EXPOSE_MODE" = "socks5" ] || [ -z "$EXPOSE_MODE" ]; then
+            PID_SOCKS=$(start_ngrok_socks)
+            echo "Ngrok SOCKS5 PID: $PID_SOCKS"
+          fi
+
+          if [ "$EXPOSE_MODE" = "http" ] || [ -z "$EXPOSE_MODE" ]; then
+            PID_HTTP=$(start_ngrok_http)
+            echo "Ngrok HTTP PID: $PID_HTTP"
+          fi
+
+          # ── exponential-backoff tunnel detection ───────────────
+          get_tunnel_url() {
+            local port="$1"
+            local logfile="$2"
+            local url=""
+            for wait in 2 2 3 3 5 5 10 10 10 10; do
+              sleep $wait
+              # try local API first
+              url=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null \
+                    | grep -o '"public_url":"tcp://[^"]*"' \
+                    | grep -v ':3128\|:1080' \
+                    | head -1 \
+                    | sed 's/"public_url":"tcp:\/\///;s/"//')
+              [ -z "$url" ] && \
+              url=$(grep -oP '"url":"tcp://\K[^"]+' "$logfile" 2>/dev/null | tail -1)
+              [ -n "$url" ] && echo "$url" && return 0
+            done
+            return 1
+          }
+
+          TUNNEL_SOCKS=""
+          TUNNEL_HTTP=""
+
+          if [ -n "$PID_SOCKS" ]; then
+            TUNNEL_SOCKS=$(get_tunnel_url 1080 "$LOG_SOCKS") || {
+              echo "::error::SOCKS5 ngrok tunnel failed"
+              tail -30 "$LOG_SOCKS"
+              exit 1
+            }
+          fi
+
+          if [ -n "$PID_HTTP" ]; then
+            TUNNEL_HTTP=$(get_tunnel_url 3128 "$LOG_HTTP") || {
+              echo "::error::HTTP ngrok tunnel failed"
+              tail -30 "$LOG_HTTP"
+              exit 1
+            }
+          fi
+
+          echo "============================================"
+          echo "  PROXY READY"
+          echo "============================================"
+          if [ -n "$TUNNEL_SOCKS" ]; then
+            echo "  SOCKS5 Proxy  : socks5://$TUNNEL_SOCKS"
+            echo "  Username      : $PROXY_USER"
+            echo "  Password      : $PROXY_PASS"
+            echo "  curl test     : curl -x socks5h://$PROXY_USER:$PROXY_PASS@$TUNNEL_SOCKS https://ifconfig.me"
+          fi
+          if [ -n "$TUNNEL_HTTP" ]; then
+            echo "  HTTP Proxy    : http://$TUNNEL_HTTP"
+            echo "  Username      : $PROXY_USER"
+            echo "  Password      : $PROXY_PASS"
+            echo "  curl test     : curl -x http://$PROXY_USER:$PROXY_PASS@$TUNNEL_HTTP https://ifconfig.me"
+          fi
+          echo "============================================"
+
+          # ── watchdog + heartbeat loop ─────────────────────────
+          TICK=0
+          while true; do
+            sleep 60
+            TICK=$((TICK + 1))
+
+            # socks watchdog
+            if [ -n "$PID_SOCKS" ] && ! kill -0 "$PID_SOCKS" 2>/dev/null; then
+              echo "Ngrok SOCKS5 exited — restarting"
+              > "$LOG_SOCKS"
+              PID_SOCKS=$(start_ngrok_socks)
+              sleep 8
+              echo "Ngrok SOCKS5 restarted — PID $PID_SOCKS"
+            fi
+
+            # http watchdog
+            if [ -n "$PID_HTTP" ] && ! kill -0 "$PID_HTTP" 2>/dev/null; then
+              echo "Ngrok HTTP exited — restarting"
+              > "$LOG_HTTP"
+              PID_HTTP=$(start_ngrok_http)
+              sleep 8
+              echo "Ngrok HTTP restarted — PID $PID_HTTP"
+            fi
+
+            if [ $((TICK % 10)) -eq 0 ]; then
+              echo "Session alive — ${TICK} min elapsed"
+            fi
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f ngrok || true
+          sudo systemctl stop danted squid || true
+          echo "Cleanup complete"
